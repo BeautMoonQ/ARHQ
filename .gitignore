@@ -1,0 +1,5 @@
+docs/_instruct.md
+logs/
+__pycache__/
+*.pyc
+run.log
