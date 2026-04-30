@@ -1,4 +1,13 @@
-"""SVDQuant baseline and ARHQ low-rank decomposition + evaluation."""
+"""Low-rank decompositions and nvfp4 simulation utilities.
+
+This module contains the two algorithms exposed by the minimal ARHQ repo:
+
+* ARHQ: Activation Residual Hessian Quantization.  The low-rank branch is
+  selected under the activation quantization residual metric
+  ``R_x = (X - Q(X)).T @ (X - Q(X)) / N``.
+* SVDQuant: a reproduction baseline that uses a plain truncated SVD of the
+  weight matrix, optionally after SmoothQuant-style smoothing.
+"""
 
 import torch
 from .quant import nvfp4_quantize
@@ -19,10 +28,10 @@ def svdquant_decompose(W: torch.Tensor, rank: int) -> dict:
     return {"B_r": B_r, "A_fac": A_fac, "W_res": W_res}
 
 
-def arhq_decompose(W: torch.Tensor, A_calib: torch.Tensor,
-                   rank: int, epsilon: float = 1e-6,
-                   w_quant_fn=None) -> dict:
-    """ARHQ: Act-Residual Hessian weighted low-rank decomposition.
+def residual_hessian_decompose(W: torch.Tensor, A_calib: torch.Tensor,
+                               rank: int, epsilon: float = 1e-6,
+                               w_quant_fn=None) -> dict:
+    """Legacy/general residual-Hessian decomposition using H + beta R.
 
     W: [D_out, D]
     A_calib: [N, D] calibration activations (already transformed if using difficulty transfer)
@@ -80,16 +89,25 @@ def arhq_decompose(W: torch.Tensor, A_calib: torch.Tensor,
     W_sig = B_r @ A_fac.T
     W_res = W - W_sig
 
-    return {"B_r": B_r, "A_fac": A_fac, "W_res": W_res,
-            "beta_a": beta_a, "beta_w": beta_w}
+    return {
+        "B_r": B_r,
+        "A_fac": A_fac,
+        "W_res": W_res,
+        "beta_a": beta_a,
+        "beta_w": beta_w,
+        "metric": "H_plus_beta_R",
+    }
 
 
-def r_only_decompose(W: torch.Tensor, A_calib: torch.Tensor,
-                     rank: int, epsilon: float = 1e-6) -> dict:
-    """R-only decomposition: use only quantization residual covariance R.
+def arhq_decompose(W: torch.Tensor, A_calib: torch.Tensor,
+                   rank: int, epsilon: float = 1e-6) -> dict:
+    """ARHQ decomposition using only activation quantization residual Hessian.
 
-    H_res = R_a = E^T E / N, where E = A - Q(A).
-    No activation Hessian H, no beta hyperparameter.
+    Objective:
+        min_rank(L)<=r || E_x @ (W - L).T ||_F^2
+
+    where E_x = X - Q(X).  Equivalently, solve a weighted low-rank
+    approximation under G_x = E_x.T @ E_x / N.
     """
     N, D = A_calib.shape
 
@@ -114,7 +132,24 @@ def r_only_decompose(W: torch.Tensor, A_calib: torch.Tensor,
     W_sig = B_r @ A_fac.T
     W_res = W - W_sig
 
-    return {"B_r": B_r, "A_fac": A_fac, "W_res": W_res}
+    return {
+        "B_r": B_r,
+        "A_fac": A_fac,
+        "W_res": W_res,
+        "metric": "activation_residual",
+    }
+
+
+def r_only_decompose(W: torch.Tensor, A_calib: torch.Tensor,
+                     rank: int, epsilon: float = 1e-6) -> dict:
+    """Compatibility alias for ARHQ.
+
+    Older experiment scripts used ``r_only`` for the current ARHQ method.
+    New code should call :func:`arhq_decompose` or pass ``method=arhq``.
+    """
+    out = arhq_decompose(W, A_calib, rank, epsilon=epsilon)
+    out["legacy_method"] = "r_only"
+    return out
 
 
 def compute_snr(Y_true: torch.Tensor, Y_hat: torch.Tensor) -> float:
@@ -163,6 +198,8 @@ def evaluate_single(A_eval: torch.Tensor, W: torch.Tensor,
         decomp = svdquant_decompose(W_t, rank)
     elif method == "arhq":
         decomp = arhq_decompose(W_t, A_calib_t, rank)
+    elif method == "arhq_full":
+        decomp = residual_hessian_decompose(W_t, A_calib_t, rank)
     elif method == "r_only":
         decomp = r_only_decompose(W_t, A_calib_t, rank)
     else:

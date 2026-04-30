@@ -3,3 +3,9 @@ logs/
 __pycache__/
 *.pyc
 run.log
+.pytest_cache/
+*.log
+results/
+eval_result/
+data/calib_data/
+data/calib_tensor/
