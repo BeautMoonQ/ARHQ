@@ -10,7 +10,7 @@ This module contains the two algorithms exposed by the minimal ARHQ repo:
 """
 
 import torch
-from .quant import nvfp4_quantize
+from .quant import nvfp4_quantize, nvfp4_quantize_2d
 
 
 def svdquant_decompose(W: torch.Tensor, rank: int) -> dict:
@@ -152,6 +152,98 @@ def r_only_decompose(W: torch.Tensor, A_calib: torch.Tensor,
     return out
 
 
+def _truncate_full_svd(B_full: torch.Tensor, A_full: torch.Tensor,
+                       W: torch.Tensor, rank: int) -> dict:
+    """Truncate full-rank SVD factors to `rank` and recompute W_res in fp32.
+
+    B_full: [D_out, R_max] — left factor at max rank
+    A_full: [D_in,  R_max] — right factor at max rank
+    """
+    B_r = B_full[:, :rank].contiguous()
+    A_fac = A_full[:, :rank].contiguous()
+    W_res = W - B_r @ A_fac.T
+    return {"B_r": B_r, "A_fac": A_fac, "W_res": W_res}
+
+
+def svdquant_decompose_multirank(W: torch.Tensor, ranks: list[int]) -> dict[int, dict]:
+    """Compute SVDQuant decomposition once and produce all `ranks` independently.
+
+    Each per-rank result is bit-identical (in fp32) to calling
+    :func:`svdquant_decompose` with that rank, because SVD singular vectors are
+    nested. W_res is recomputed in fp32 from the truncated factors, so there is
+    no fp16 accumulation error.
+    """
+    max_rank = max(ranks)
+    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+    B_full = U[:, :max_rank] * S[:max_rank]   # [D_out, max_rank]
+    A_full = Vh[:max_rank, :].T               # [D_in,  max_rank]
+    out = {}
+    for r in ranks:
+        out[r] = _truncate_full_svd(B_full, A_full, W, r)
+    return out
+
+
+def _compute_R_chunked(A_calib: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
+    """Compute R = E^T E / N where E = A - Q(A), processing in chunks.
+
+    Avoids materializing the full nvfp4 intermediate tensor (which expands
+    the last dim by 15x and OOMs on large FFN activations).
+    """
+    N, D = A_calib.shape
+    R = torch.zeros(D, D, dtype=A_calib.dtype, device=A_calib.device)
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        chunk = A_calib[start:end]
+        e = chunk - nvfp4_quantize(chunk)
+        R += e.T @ e
+    return R / N
+
+
+def arhq_decompose_multirank(W: torch.Tensor, A_calib: torch.Tensor,
+                             ranks: list[int],
+                             epsilon: float = 1e-6) -> dict[int, dict]:
+    """Compute ARHQ decomposition once and produce all `ranks` independently.
+
+    Reuses the same R eigendecomposition and SVD of M = W @ R_sqrt for all
+    ranks. Each per-rank result is bit-identical (in fp32) to calling
+    :func:`arhq_decompose` with that rank.
+    """
+    max_rank = max(ranks)
+    N, D = A_calib.shape
+
+    R_a = _compute_R_chunked(A_calib)
+
+    eigenvalues, U_h = torch.linalg.eigh(R_a)
+    eigenvalues = eigenvalues.clamp(min=epsilon)
+    sqrt_eig = eigenvalues.sqrt()
+    inv_sqrt_eig = 1.0 / sqrt_eig
+    R_sqrt = U_h @ torch.diag(sqrt_eig) @ U_h.T
+    R_inv_sqrt = U_h @ torch.diag(inv_sqrt_eig) @ U_h.T
+
+    M = W @ R_sqrt
+    U_m, S_m, Vh_m = torch.linalg.svd(M, full_matrices=False)
+    B_full = U_m[:, :max_rank] * S_m[:max_rank]      # [D_out, max_rank]
+    A_tilde_full = Vh_m[:max_rank, :].T              # [D_in, max_rank]
+    A_full = R_inv_sqrt @ A_tilde_full               # [D_in, max_rank]
+
+    out = {}
+    for r in ranks:
+        d = _truncate_full_svd(B_full, A_full, W, r)
+        d["metric"] = "activation_residual"
+        out[r] = d
+    return out
+
+
+def decompose_multirank(method: str, W: torch.Tensor, A_calib: torch.Tensor,
+                        ranks: list[int]) -> dict[int, dict]:
+    """Dispatch multi-rank decomposition by method name."""
+    if method == "svdquant":
+        return svdquant_decompose_multirank(W, ranks)
+    if method in ("arhq", "r_only"):
+        return arhq_decompose_multirank(W, A_calib, ranks)
+    raise ValueError(f"unknown method: {method}")
+
+
 def compute_snr(Y_true: torch.Tensor, Y_hat: torch.Tensor) -> float:
     """SNR in dB."""
     err = (Y_hat - Y_true).norm()
@@ -190,7 +282,7 @@ def evaluate_single(A_eval: torch.Tensor, W: torch.Tensor,
         W_t = W
 
     # Baseline: no low-rank, just quantize everything
-    Y_baseline = nvfp4_quantize(A_eval_t) @ nvfp4_quantize(W_t).T
+    Y_baseline = nvfp4_quantize(A_eval_t) @ nvfp4_quantize_2d(W_t).T
     snr_baseline = compute_snr(Y_true, Y_baseline)
 
     # Low-rank decomposition on (possibly smoothed) weight
@@ -211,7 +303,7 @@ def evaluate_single(A_eval: torch.Tensor, W: torch.Tensor,
 
     # Deploy: Y ≈ A_t @ (A_fac @ B_r.T) + Q(A_t) @ Q(W_res).T
     # Low-rank branch in float, main branch quantized
-    Y_main = nvfp4_quantize(A_eval_t) @ nvfp4_quantize(W_res).T
+    Y_main = nvfp4_quantize(A_eval_t) @ nvfp4_quantize_2d(W_res).T
     Y_lr = (A_eval_t @ A_fac) @ B_r.T
     Y_hat = Y_main + Y_lr
     snr_method = compute_snr(Y_true, Y_hat)

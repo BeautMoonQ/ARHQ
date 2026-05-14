@@ -23,6 +23,11 @@ def _fp4_round(x_scaled: torch.Tensor) -> torch.Tensor:
     return all_vals[diffs.argmin(dim=-1)]
 
 
+def _fp4_codebook(device, dtype):
+    fp4_pos = torch.tensor(_FP4_POS, device=device, dtype=dtype)
+    return torch.cat([-fp4_pos[1:].flip(0), fp4_pos])
+
+
 def nvfp4_quantize(x: torch.Tensor, block_size: int = 16) -> torch.Tensor:
     """NVFP4 (E2M1) quantization simulation, 1D per-block FP8 E4M3 scale."""
     original_shape = x.shape
@@ -66,3 +71,65 @@ def nvfp4_quantize_2d(W: torch.Tensor, block_h: int = 16, block_w: int = 16) -> 
     W_dequant = (W_quant * scale).reshape(H, Wi)
 
     return W_dequant[:D_out, :D_in]
+
+
+def nvfp4_pack_2d(W: torch.Tensor, block_h: int = 16, block_w: int = 16) -> dict:
+    """Pack simulated NVFP4 E2M1 weights with 2D block scales.
+
+    Returns a storage-oriented representation:
+      codes: packed uint8 tensor, two 4-bit FP4 code indices per byte
+      scale: simulated FP8 E4M3 scale, stored as fp16 values
+
+    This is a simulation format: scales are not packed to real E4M3 bytes.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"Expected 2D weight, got shape={tuple(W.shape)}")
+    D_out, D_in = W.shape
+    pad_h = (block_h - D_out % block_h) % block_h
+    pad_w = (block_w - D_in % block_w) % block_w
+    W_pad = W
+    if pad_h > 0 or pad_w > 0:
+        W_pad = torch.nn.functional.pad(W_pad, (0, pad_w, 0, pad_h))
+
+    H, Wi = W_pad.shape
+    W_blocks = W_pad.reshape(H // block_h, block_h, Wi // block_w, block_w)
+    amax = W_blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+    scale = _fp8_e4m3_sim(amax / 6.0)
+
+    codebook = _fp4_codebook(W_pad.device, W_pad.dtype)
+    x_scaled = (W_blocks / scale).clamp(-6.0, 6.0)
+    diffs = (x_scaled.unsqueeze(-1) - codebook).abs()
+    codes = diffs.argmin(dim=-1).to(torch.uint8).reshape(-1)
+    if codes.numel() % 2:
+        codes = torch.nn.functional.pad(codes, (0, 1))
+    packed = (codes[0::2] | (codes[1::2] << 4)).contiguous()
+    return {
+        "packed": packed.cpu(),
+        "scale": scale.squeeze(3).squeeze(1).half().cpu().contiguous(),
+        "orig_shape": torch.tensor([D_out, D_in], dtype=torch.int32),
+        "padded_shape": torch.tensor([H, Wi], dtype=torch.int32),
+        "block_shape": torch.tensor([block_h, block_w], dtype=torch.int32),
+    }
+
+
+def nvfp4_unpack_2d(packed: torch.Tensor, scale: torch.Tensor,
+                    orig_shape: tuple[int, int], padded_shape: tuple[int, int],
+                    block_shape: tuple[int, int] = (16, 16),
+                    dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """Dequantize a tensor produced by :func:`nvfp4_pack_2d`."""
+    block_h, block_w = block_shape
+    H, Wi = padded_shape
+    D_out, D_in = orig_shape
+    total_codes = H * Wi
+    flat = packed.to(torch.uint8).reshape(-1)
+    codes = torch.empty(flat.numel() * 2, dtype=torch.uint8, device=flat.device)
+    codes[0::2] = flat & 0x0F
+    codes[1::2] = flat >> 4
+    codes = codes[:total_codes].long()
+    codebook = _fp4_codebook(codes.device, dtype)
+    vals = codebook[codes].reshape(H // block_h, block_h, Wi // block_w, block_w)
+    scale_t = scale.to(device=vals.device, dtype=dtype).reshape(
+        H // block_h, 1, Wi // block_w, 1
+    )
+    W = (vals * scale_t).reshape(H, Wi)
+    return W[:D_out, :D_in].contiguous()

@@ -40,7 +40,7 @@ from arhq.eval_utils import (
     load_partial_results,
 )
 
-from arhq.quant import nvfp4_quantize
+from arhq.quant import nvfp4_quantize, nvfp4_quantize_2d
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -91,7 +91,7 @@ class QuantizedLowRankLinear(nn.Module):
             self.scale = None
 
         # Pre-quantize W_res (it's static) to avoid recomputing every forward
-        self.register_buffer("W_res_q", nvfp4_quantize(W_res.float()).to(W_res.dtype))
+        self.register_buffer("W_res_q", nvfp4_quantize_2d(W_res.float()).to(W_res.dtype))
         # W_res itself is no longer needed after pre-quantization. Keeping only
         # W_res_q matters for all-layer FFN runs where memory is tight.
         self.W_res = None
@@ -121,7 +121,7 @@ class QuantizedOnlyLinear(nn.Module):
 
     def __init__(self, W: torch.Tensor):
         super().__init__()
-        self.register_buffer("W_q", nvfp4_quantize(W.float()).to(W.dtype))
+        self.register_buffer("W_q", nvfp4_quantize_2d(W.float()).to(W.dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape[:-1]

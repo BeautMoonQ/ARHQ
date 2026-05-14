@@ -16,7 +16,7 @@ E_x = X - Q_x(X)
 min_rank(L)<=r || E_x (W - L)^T ||_F^2
 ```
 
-With `G_x = E_x^T E_x / N`, this becomes a weighted low-rank decomposition under the activation residual Hessian metric. The resulting LoRA branch is kept in floating point, while the residual branch is evaluated with simulated nvfp4 quantization.
+With `G_x = E_x^T E_x / N`, this becomes a weighted low-rank decomposition under the activation residual Hessian metric. The resulting LoRA branch is kept in floating point, while the residual branch is evaluated with simulated nvfp4 quantization. The implementation uses 1D block scaling for activations and 16x16 2D block scaling for weights, matching the default NVFP4 weight-scaling layout used by Transformer Engine.
 
 ## Repository Scope
 
